@@ -1,65 +1,118 @@
+import datetime
 import json
 import os
+import urllib.parse
 import urllib.request
 
-BASE = os.environ.get("BASE_CURRENCY", "USD")
-TARGET = os.environ.get("TARGET_CURRENCY", "KRW")
-BOT_TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+API_URL = "https://api.frankfurter.dev/v2/rates"
+METAL_URL = "https://api.gold-api.com/price"
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+HEADERS = {"User-Agent": "send-rate/1.0"}
+G_PER_OZ = 31.1034768
+OZ_PER_KG = 1000 / G_PER_OZ
+LB_PER_KG = 1 / 0.45359237
+WEEKDAYS = "월화수목금토일"
+
+# 강수 알림 대상 도시 (이름, 위도, 경도)
+CITIES = [("대전", 36.3504, 127.3845)]
+RAIN_THRESHOLD = 50
 
 
-def fetch_rate(base, target):
-    url = f"https://open.er-api.com/v6/latest/{base}"
-    with urllib.request.urlopen(url, timeout=10) as res:
-        data = json.load(res)
-    if data.get("result") != "success":
-        raise RuntimeError(f"환율 조회 실패: {data}")
-    return data["rates"][target]
+def get_json(url):
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=10) as res:
+        return json.load(res)
 
 
-WEATHER_CODES = {
-    0: "맑음", 1: "대체로 맑음", 2: "구름 조금", 3: "흐림",
-    45: "안개", 48: "안개", 51: "이슬비", 53: "이슬비", 55: "이슬비",
-    61: "비", 63: "비", 65: "강한 비", 71: "눈", 73: "눈", 75: "강한 눈",
-    80: "소나기", 81: "소나기", 82: "강한 소나기", 95: "뇌우",
-}
+def fetch_krw_rate(base):
+    query = urllib.parse.urlencode({"base": base, "quotes": "KRW"})
+    data = get_json(f"{API_URL}?{query}")[0]
+    return data["rate"], data["date"]
 
 
-def fetch_weather():
-    url = (
-        "https://api.open-meteo.com/v1/forecast"
-        "?latitude=36.3504&longitude=127.3845"
-        "&current=temperature_2m,weather_code"
-        "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-        "&timezone=Asia%2FSeoul&forecast_days=1"
+def fetch_usd_price(symbol):
+    return get_json(f"{METAL_URL}/{symbol}")["price"]
+
+
+def fetch_rain_probabilities(cities):
+    """예보 날짜(YYYY-MM-DD)와 도시별 오늘의 최대 강수확률(%)을 반환한다."""
+    query = urllib.parse.urlencode(
+        {
+            "latitude": ",".join(str(lat) for _, lat, _ in cities),
+            "longitude": ",".join(str(lon) for _, _, lon in cities),
+            "daily": "precipitation_probability_max",
+            "timezone": "Asia/Seoul",
+            "forecast_days": 1,
+        }
     )
-    with urllib.request.urlopen(url, timeout=10) as res:
-        data = json.load(res)
-    cur, day = data["current"], data["daily"]
-    desc = WEATHER_CODES.get(cur["weather_code"], "알 수 없음")
+    data = get_json(f"{WEATHER_URL}?{query}")
+    # 위치가 여러 개면 위치별 결과의 배열로 응답한다.
+    if isinstance(data, dict):
+        data = [data]
+    date = data[0]["daily"]["time"][0]
+    probs = [
+        (name, item["daily"]["precipitation_probability_max"][0])
+        for (name, _, _), item in zip(cities, data)
+    ]
+    return date, probs
+
+
+def format_date(date):
+    day = datetime.date.fromisoformat(date)
+    return f"{date} ({WEEKDAYS[day.weekday()]})"
+
+
+def send_telegram(token, chat_id, text):
+    body = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    with urllib.request.urlopen(url, data=body, timeout=10) as res:
+        res.read()
+
+
+def build_rate_text():
+    usd, date = fetch_krw_rate("USD")
+    eur, _ = fetch_krw_rate("EUR")
+    jpy, _ = fetch_krw_rate("JPY")
+
+    gold = fetch_usd_price("XAU")
+    silver = fetch_usd_price("XAG")
+    copper = fetch_usd_price("HG")
+
     return (
-        f"{desc} {cur['temperature_2m']:.0f}°C "
-        f"(최저 {day['temperature_2m_min'][0]:.0f}° / 최고 {day['temperature_2m_max'][0]:.0f}°, "
-        f"강수확률 {day['precipitation_probability_max'][0]}%)"
+        f"환율 - {format_date(date)} 기준\n"
+        f"USD 1달러: {usd:,.2f}원\n"
+        f"EUR 1유로: {eur:,.2f}원\n"
+        f"JPY 100엔: {jpy * 100:,.2f}원\n"
+        f"\n"
+        f"원자재 (USD / 원화)\n"
+        f"금: ${gold:,.2f}/oz ({gold / G_PER_OZ * usd:,.0f}원/g)\n"
+        f"은: ${silver:,.2f}/oz ({silver * OZ_PER_KG * usd:,.0f}원/kg)\n"
+        f"구리: ${copper:,.4f}/lb ({copper * LB_PER_KG * usd:,.0f}원/kg)"
     )
 
 
-def send_message(text):
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data=json.dumps({"chat_id": CHAT_ID, "text": text}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    urllib.request.urlopen(req, timeout=10).read()
+def build_rain_text(threshold):
+    """강수확률이 threshold% 이상인 도시를 알리고, 없으면 비 소식이 없다고 알린다."""
+    date, probs = fetch_rain_probabilities(CITIES)
+    rainy = [
+        (name, prob) for name, prob in probs if prob is not None and prob >= threshold
+    ]
+    title = f"강수 알림 - {format_date(date)}"
+    if not rainy:
+        return f"{title}\n오늘은 강수확률 {threshold}% 이상인 도시가 없습니다. 비 소식 없음"
+    rainy.sort(key=lambda item: item[1], reverse=True)
+    lines = [title, f"강수확률 {threshold}% 이상인 도시"]
+    lines += [f"{name}: {prob}%" for name, prob in rainy]
+    return "\n".join(lines)
 
 
 def main():
-    rate = fetch_rate(BASE, TARGET)
-    weather = fetch_weather()
-    send_message(
-        f"💱 오늘의 환율: 1 {BASE} = {rate:,.2f} {TARGET}\n"
-        f"🌤 대전 날씨: {weather}"
-    )
+    token = os.environ["TELEGRAM_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+    text = build_rate_text() + "\n\n" + build_rain_text(RAIN_THRESHOLD)
+    send_telegram(token, chat_id, text)
+    print(text)
 
 
 if __name__ == "__main__":
