@@ -4,7 +4,8 @@ import urllib.request
 
 BASE = os.environ.get("BASE_CURRENCY", "USD")
 TARGET = os.environ.get("TARGET_CURRENCY", "KRW")
-WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 
 def fetch_rate(base, target):
@@ -18,8 +19,8 @@ def fetch_rate(base, target):
 
 def send_message(text):
     req = urllib.request.Request(
-        WEBHOOK_URL,
-        data=json.dumps({"text": text}).encode("utf-8"),
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data=json.dumps({"chat_id": CHAT_ID, "text": text}).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
     urllib.request.urlopen(req, timeout=10).read()
