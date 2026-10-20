@@ -4,7 +4,7 @@ import urllib.request
 
 BASE = os.environ.get("BASE_CURRENCY", "USD")
 TARGET = os.environ.get("TARGET_CURRENCY", "KRW")
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+BOT_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 
